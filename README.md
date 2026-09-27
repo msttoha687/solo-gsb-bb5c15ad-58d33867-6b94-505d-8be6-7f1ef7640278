@@ -1,6 +1,6 @@
 # 🔎 OpenAPI 版本兼容性审查工具
 
-对比新旧两份 **OpenAPI 3.x**（JSON / YAML）文档，递归解析 `$ref`（**支持循环引用**）、合并 `allOf`，按**请求 / 响应两个方向**的语义规则判断每一处变更是否向后兼容，精确定位破坏性变更的 JSON 路径并给出原因。支持结果筛选、**根因聚合视图**（有向影响组）、引用展开树浏览、审查报告下载、**单条发现的最小复现包导出**、历史记录与**破坏项对账**（基线审查 vs 当前审查）、**限时豁免**（按 API 标识为破坏项设置带 UTC 到期时间的豁免，"未豁免为零才可放行"），以及**组件可达性审计**（从 paths / webhooks 入口沿本地 `$ref` 传递追踪，列出未被入口触达的组件并标出新版独有的未使用组件）。
+对比新旧两份 **OpenAPI 3.x**（JSON / YAML）文档，递归解析 `$ref`（**支持循环引用**）、合并 `allOf`，按**请求 / 响应两个方向**的语义规则判断每一处变更是否向后兼容，精确定位破坏性变更的 JSON 路径并给出原因；并按 OpenAPI 语义计算每个操作的**有效认证要求**（操作级 `security` 覆盖根级），识别认证收紧（缺少方案 / OAuth scope 变多 / 匿名变需认证）类破坏。支持结果筛选、**根因聚合视图**（有向影响组）、引用展开树浏览、审查报告下载、**单条发现的最小复现包导出**、历史记录与**破坏项对账**（基线审查 vs 当前审查）、**限时豁免**（按 API 标识为破坏项设置带 UTC 到期时间的豁免，"未豁免为零才可放行"），以及**组件可达性审计**（从 paths / webhooks 入口沿本地 `$ref` 传递追踪，列出未被入口触达的组件并标出新版独有的未使用组件）。
 
 技术栈：**FastAPI + SQLite + 原生 JavaScript**（前端零构建、零框架依赖）。
 
@@ -17,6 +17,13 @@ docker compose up -d --build
 启动后访问：
 
 > **http://localhost:8000**
+
+| 入口 | 地址 / 端口 |
+| --- | --- |
+| 审查界面 | http://localhost:8000 （宿主机 **8000** 端口） |
+| 交互式 API 文档（Swagger UI） | http://localhost:8000/docs |
+| 健康检查（Docker HEALTHCHECK 探测） | `GET http://localhost:8000/api/health` |
+| 容器内监听 | `0.0.0.0:8000`（由 `docker-compose.yml` 的 `"8000:8000"` 映射到宿主机 8000） |
 
 端口说明：容器内监听 `8000`，通过 `docker-compose.yml` 映射到宿主机 **8000**；审查数据保存在 Docker 卷 `review-data`（容器内 `/data/reviews.db`），重启不丢失。镜像内置 `HEALTHCHECK`，周期性探测 `GET /api/health`，可通过 `docker ps` 查看健康状态。
 
@@ -43,7 +50,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 1. 打开 http://localhost:8000 ，在左右两栏**粘贴**或点击「上传」选择旧版 / 新版 OpenAPI 文件（`.json` / `.yaml` / `.yml` 均可，也可混用）。
 2. （可选）在「开始审查」旁的输入框填写 **API 标识**——用于限时豁免匹配；留空则该审查不应用豁免。
-2. 可先点击内置示例：**典型破坏性变更 / 循环 $ref / 纯兼容新增 / 枚举约束收窄**。
+2. 可先点击内置示例：**典型破坏性变更 / 循环 $ref / 纯兼容新增 / 枚举约束收窄 / 认证要求收紧**。
 3. 点击「开始审查 →」。
 4. 结果区提供：
    - 顶部统计卡片与总体结论（✅ 向后兼容 / ❌ N 项破坏性变更）；
@@ -90,6 +97,35 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 \* 请求字段从契约移除时服务端可能开始忽略/拒绝，工具以兼容记录并在原因中注明。
 
 结构层面还覆盖：路径与操作的新增/删除、pathItem 级与操作级参数合并比较、参数必填性 / `style` / `explode` / `deprecated`、请求体必填性变化、媒体类型增删（请求 415 / 响应 Content-Type）、响应状态码增删、`servers` 增删、`operationId` 变化、`oneOf/anyOf` 分支增删等。
+
+### 🔐 认证要求（security）兼容性
+
+对**两版都存在的 paths 操作**（新增 / 删除操作另由 `operation-added` / `operation-removed` 覆盖），按 OpenAPI 语义先计算每侧的**有效认证要求**，再做组合级比较：
+
+- **有效要求**：操作显式声明 `security` 时以**操作级覆盖根级**（哪怕是空数组，也不回落根级）；操作缺省时继承根级 `security`；根级与操作级都缺省视为**允许匿名**。`security` 缺省、空数组 `[]` 与 `[{}]` 都表示允许匿名，三者等价不产生发现。
+- **组合语义**：`security` 数组中的对象之间是**「或」**（满足任一即可调用），同一对象内的多个方案是**「且」**（必须同时具备），OAuth2 / openIdConnect 的 **scope 集合须全部满足**。
+- **兼容性判定**：对旧版每一个可用认证组合，若在新版存在一个**要求不更严**的组合可被该组合满足（同名方案具备、且新版要求的 scope 都被旧凭据授予的 scope 覆盖；新版组合允许匿名则接受一切），该旧组合即继续可用；
+  - 旧版**任一**可用组合在新版找不到这样的组合 → 🔴 破坏（`security-requirements-tightened`）：新增必填方案、追加 OAuth scope、匿名变为需要认证等，持旧凭据的调用方可能收到 401/403；
+  - 否则有效要求确有变化（新增可选认证方式、scope 收窄、改为允许匿名、去掉「且」中的方案等）→ 🟢 兼容（`security-requirements-relaxed`）；
+  - 规范化后完全相同（如 `[]` ↔ `[{}]`、仅声明位置变化而有效要求不变）不产生发现。
+- **定位**：发现标出操作（端点）、双侧 JSON Pointer（操作级为 `/paths{path}/{method}/security`，继承根级为 `/security`，完全缺省侧锚到操作对象）、旧 / 新有效要求（`old_value` / `new_value`：生效来源 `operation` / `root` / `default`、原始 security、规范化后的认证组合）以及每个不可用旧组合的具体缺口（缺少哪个方案 / 哪些 scope）。
+- 该类发现归类为 **认证 / 请求方向**，自动接入级别 / 方向 / 分类 / 关键字**筛选**、Markdown / JSON **报告**、破坏项**限时豁免**与**破坏项对账**；最小复现包会保留根级 `security` 以保证可复现。
+
+认证规则示例：
+
+| 旧版有效要求 | 新版有效要求 | 结论 |
+| --- | --- | --- |
+| 匿名 | `oauth2[read]` | 🔴 旧匿名调用将收到 401/403 |
+| `oauth2[read]` | `oauth2[read, write]` | 🔴 追加 OAuth scope |
+| `apiKey`（唯一「或」分支） | `oauth2[read]` | 🔴 旧 apiKey 组合无不更严分支 |
+| `apiKey` 或 `oauth2[read]` | `oauth2[read]` | 🔴 apiKey 分支消失（oauth 分支仍可用） |
+| `apiKey` 且 `oauth2[read]`（同一对象内「且」） | `apiKey` | 🟢 去掉一项合取要求 |
+| `oauth2[a,b]` | `oauth2[a]` | 🟢 scope 收窄 |
+| `oauth2[read]` | `apiKey` 或 `oauth2[read]` | 🟢 新增可选认证方式 |
+| `oauth2[read]` | `[]`（允许匿名） | 🟢 放宽为匿名 |
+| `[]` | `[{}]` | — 等价，无发现 |
+
+内置示例「**认证要求收紧**」演示根级继承、操作级覆盖、`[]` 与 `[{}]` 等价、scope 追加、方案替换与新增「或」分支等场景。
 
 > 页面内「规则说明」标签有完整列表；每条发现都带稳定的 `rule_id`（如 `property-became-required`、`enum-value-added`），便于在 CI 中按规则处理。
 
@@ -254,7 +290,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │   ├── main.py        # FastAPI：审查 / 历史 / 引用树 / 根因聚合 / 破坏项对账 / 组件可达性审计 / 限时豁免 / 报告下载 / 健康检查接口
 │   ├── parser.py      # JSON·YAML 载入与 OpenAPI 3.x 校验
 │   ├── refs.py        # JSON Pointer、$ref 解析、循环安全的引用展开树
-│   ├── diff.py        # 语义兼容性规则引擎（请求/响应双方向）
+│   ├── diff.py        # 语义兼容性规则引擎（请求/响应双方向 + 操作级/根级 security 认证要求）
 │   ├── groups.py      # 根因聚合：端点×方向分区、同源归并、祖先吸收的有向影响组
 │   ├── reconcile.py   # 破坏项对账：稳定身份配对，输出新增 / 延续 / 已消失
 │   ├── reachability.py # 组件可达性审计：paths/webhooks 入口 → 本地 $ref 传递追踪，未触达组件与无效引用
@@ -266,7 +302,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │   ├── index.html     # 单页界面
 │   ├── styles.css
 │   ├── app.js         # 原生 JS：筛选 / 聚合视图 / 展开树 / 历史 / 对账 / 下载
-│   └── samples.js     # 四组内置示例（JSON + YAML）
+│   └── samples.js     # 五组内置示例（JSON + YAML，含认证要求收紧）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

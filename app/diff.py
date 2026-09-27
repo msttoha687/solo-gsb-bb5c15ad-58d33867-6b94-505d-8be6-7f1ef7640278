@@ -432,6 +432,102 @@ class Engine:
         )
         self._compare_request_body(endpoint, base, old_op, new_op)
         self._compare_responses(endpoint, base, old_op, new_op)
+        self._compare_security(
+            endpoint, base, raw_old_op, old_op, raw_new_op, new_op
+        )
+
+    # ------------------------------------------------------------------ #
+    # 认证要求（security）
+    # ------------------------------------------------------------------ #
+    def _effective_security(
+        self,
+        root_security: Any,
+        raw_op: Any,
+        op: dict[str, Any],
+        base: str,
+    ) -> tuple[Any, str, str]:
+        """计算操作的有效 security：(原始 security, JSON Pointer, 来源)。
+
+        - 操作级 security 存在（含 OpenAPI 3.1 中 $ref 兄弟字段）即以其为准，
+          哪怕是空数组（显式允许匿名，不回落根级）；
+        - 操作级缺省时继承根级 security；根级也缺省视为允许匿名。
+        来源取值：operation / root / default。
+        """
+        if isinstance(raw_op, dict) and "security" in raw_op:
+            return raw_op.get("security"), base + "/security", "operation"
+        if isinstance(op, dict) and "security" in op:
+            return op.get("security"), base + "/security", "operation"
+        # 根级显式声明（含 security: [] 显式允许匿名）；非数组的非法值按匿名处理
+        if isinstance(root_security, list):
+            return root_security, "/security", "root"
+        return None, base, "default"
+
+    def _compare_security(
+        self,
+        endpoint: str,
+        base: str,
+        raw_old_op: Any,
+        old_op: dict[str, Any],
+        raw_new_op: Any,
+        new_op: dict[str, Any],
+    ) -> None:
+        """比较两版同一操作的有效认证要求（仅两版都存在的操作会走到这里）。
+
+        security 列表中的对象之间是"或"，对象内多个方案是"且"，
+        OAuth scope 集合须全部满足。旧版任一可用认证组合在新版找不到
+        "要求不更严"的组合即破坏；否则有效要求有变化记为兼容。
+        """
+        old_sec, old_ptr, old_src = self._effective_security(
+            self.old.get("security"), raw_old_op, old_op, base
+        )
+        new_sec, new_ptr, new_src = self._effective_security(
+            self.new.get("security"), raw_new_op, new_op, base
+        )
+        old_alts = _sec_alternatives(old_sec)
+        new_alts = _sec_alternatives(new_sec)
+
+        # 规范化后相同（[] 与 [{}]、声明位置差异等）即无要求变化
+        if old_alts == new_alts:
+            return
+
+        old_value = _sec_value(old_sec, old_alts, old_src)
+        new_value = _sec_value(new_sec, new_alts, new_src)
+
+        unsupported: list[tuple] = []
+        for alt in sorted(old_alts, key=_sec_combo_sort):
+            if not any(_sec_combo_covers(n, alt) for n in new_alts):
+                unsupported.append((alt, _sec_best_missing(alt, new_alts)))
+
+        if unsupported:
+            bits = [
+                _sec_block_reason(alt, missing) for alt, missing in unsupported
+            ]
+            self.add(
+                rule_id="security-requirements-tightened", severity=BREAKING,
+                category="认证", direction="request", change="changed",
+                endpoint=endpoint, location="security",
+                old_json_path=old_ptr, new_json_path=new_ptr,
+                old_ref=None, new_ref=None,
+                message=(
+                    "认证要求收紧："
+                    + "；".join(bits)
+                    + "。持有旧版凭据的调用方可能收到 401/403。"
+                ),
+                old_value=old_value, new_value=new_value,
+            )
+        else:
+            self.add(
+                rule_id="security-requirements-relaxed", severity=NON_BREAKING,
+                category="认证", direction="request", change="changed",
+                endpoint=endpoint, location="security",
+                old_json_path=old_ptr, new_json_path=new_ptr,
+                old_ref=None, new_ref=None,
+                message=(
+                    "有效认证要求放宽或等价改写：旧版任一可用认证组合仍可在新版"
+                    "满足（含新增可选认证方式、scope 收窄、允许匿名），现有客户端不受影响。"
+                ),
+                old_value=old_value, new_value=new_value,
+            )
 
     # ------------------------------------------------------------------ #
     # 参数
@@ -1612,6 +1708,139 @@ def _media_types(rb: Any) -> list[str]:
     if isinstance(rb, dict) and isinstance(rb.get("content"), dict):
         return list(rb["content"])
     return []
+
+
+# ---------------------------------------------------------------------- #
+# 认证要求（security）
+# ---------------------------------------------------------------------- #
+def _sec_combo(req: Any) -> frozenset:
+    """单个 Security Requirement 对象 → {(scheme, frozenset(scopes))}。
+
+    对象内多个方案是"且"；scope 列表按集合处理（全部满足即可）。
+    空对象 {} 表示无需认证，对应空集合。
+    """
+    if not isinstance(req, dict):
+        return frozenset()
+    items: set[tuple[str, frozenset[str]]] = set()
+    for name, scopes in req.items():
+        scope_set = (
+            {str(s) for s in scopes} if isinstance(scopes, list) else set()
+        )
+        items.add((str(name), frozenset(scope_set)))
+    return frozenset(items)
+
+
+def _sec_alternatives(security: Any) -> frozenset[frozenset]:
+    """有效 security → 可用认证组合集合（或关系去重后的 frozenset）。
+
+    - security 缺省（None）、[]、[{}] 均允许匿名：统一表示为 {空组合}；
+    - 列表中每个对象是一个"或"分支；分支内方案为"且"。
+    """
+    if not isinstance(security, list):
+        return frozenset({frozenset()})
+    alts = {_sec_combo(req) for req in security if isinstance(req, dict)}
+    return alts if alts else frozenset({frozenset()})
+
+
+def _sec_combo_covers(candidate: frozenset, required: frozenset) -> bool:
+    """新版组合 candidate 是否接受满足旧版组合 required 的客户端（要求不更严）。
+
+    满足旧版组合的客户端持有 required 中的全部方案与 scope；它能通过新版
+    组合当且仅当新版要求的每个方案（及其全部 scope）都在其持有范围内：
+    - candidate 为空（允许匿名）时接受任意客户端；
+    - 否则 candidate 中每个（同名）方案都要在 required 中，
+      且 candidate 要求的 OAuth scope 被 required 授予的 scope 覆盖；
+      旧客户端持有 candidate 之外的多余方案不影响通过（新版要求更少即放宽）。
+    """
+    if not candidate:
+        return True
+    held_by_name = {name: scopes for name, scopes in required}
+    for name, need_scopes in candidate:
+        held = held_by_name.get(name)
+        if held is None:
+            return False
+        if not need_scopes <= held:
+            return False
+    return True
+
+
+def _sec_missing(candidate: frozenset, required: frozenset) -> list[tuple[str, frozenset[str]]]:
+    """满足旧版 required 的客户端通过新版 candidate 仍缺少的认证要素。
+
+    返回 (scheme, 缺少 scope 集合) 列表，空列表表示可被满足；
+    缺少 scope 集合为空表示整个方案缺失，非空表示方案具备但 scope 不足。
+    """
+    held_by_name = {name: scopes for name, scopes in required}
+    missing: list[tuple[str, frozenset[str]]] = []
+    for name, need_scopes in sorted(candidate, key=lambda x: x[0]):
+        held = held_by_name.get(name)
+        if held is None:
+            missing.append((name, frozenset()))
+        elif not need_scopes <= held:
+            missing.append((name, need_scopes - held))
+    return missing
+
+
+def _sec_best_missing(required: frozenset, alts: frozenset) -> list[tuple[str, frozenset[str]]]:
+    """在新版组合中挑旧客户端最接近满足的一个，给出其缺口（用于可读原因）。
+
+    优先选包含最多同名方案的组合，避免方案整缺时却报告另一个方案的 scope。
+    """
+    best: tuple | None = None  # (同名方案数, 缺口)
+    for cand in alts:
+        if not cand:
+            return []  # 新版允许匿名：必然接受任意旧客户端
+        missing = _sec_missing(cand, required)
+        same_names = len({n for n, _ in cand} & {n for n, _ in required})
+        rank = (same_names, -len(missing), -sum(len(s) for _, s in missing))
+        if best is None or rank > best[0]:
+            best = (rank, missing)
+    return best[1] if best is not None else []
+
+
+def _sec_combo_sort(combo: frozenset) -> tuple:
+    return tuple(sorted(
+        (name, tuple(sorted(scopes))) for name, scopes in combo
+    ))
+
+
+def _sec_combo_text(combo: frozenset) -> str:
+    if not combo:
+        return "匿名（无需认证）"
+    parts = []
+    for name, scopes in sorted(combo, key=lambda x: x[0]):
+        parts.append(name + (f"[{', '.join(sorted(scopes))}]" if scopes else ""))
+    return " + ".join(parts)
+
+
+def _sec_block_reason(
+    combo: frozenset, missing: list[tuple[str, frozenset[str]]]
+) -> str:
+    if not missing:
+        return f"旧版可用组合「{_sec_combo_text(combo)}」不再被满足"
+    need = []
+    for name, scopes in missing:
+        if scopes:
+            need.append(f"{name} 的 scope {sorted(scopes)}")
+        else:
+            need.append(f"{name} 方案")
+    return f"旧版组合「{_sec_combo_text(combo)}」缺少 {'、'.join(need)}"
+
+
+def _sec_combo_json(combo: frozenset) -> dict[str, list[str]]:
+    return {
+        name: sorted(scopes)
+        for name, scopes in sorted(combo, key=lambda x: x[0])
+    }
+
+
+def _sec_value(security: Any, alts: frozenset[frozenset], source: str) -> dict[str, Any]:
+    """发现项的旧值 / 新值：规范化后的有效要求 + 生效来源。"""
+    return {
+        "source": source,  # operation=操作级覆盖 | root=继承根级 | default=缺省匿名
+        "raw": security,
+        "alternatives": [_sec_combo_json(c) for c in sorted(alts, key=_sec_combo_sort)],
+    }
 
 
 def _param_brief(p: dict) -> dict:

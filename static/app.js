@@ -1329,6 +1329,16 @@
       ],
     },
     {
+      title: "认证要求（security，请求方向）",
+      items: [
+        "操作级 <code>security</code> 覆盖根级 <code>security</code>；缺省、<code>[]</code> 与 <code>[{}]</code> 均允许匿名",
+        "security 列表中对象之间是<b>或</b>，对象内多个方案是<b>且</b>，OAuth scope 集合须全部满足",
+        "旧版任一可用认证组合在新版找不到<b>要求不更严</b>的组合：🔴 <code>security-requirements-tightened</code>",
+        "新增必填方案 / 追加 OAuth scope / 匿名变为需要认证：🔴 旧客户端会收到 401/403",
+        "新增可选认证方式、scope 收窄、改为允许匿名（要求放宽或等价改写）：🟢 <code>security-requirements-relaxed</code>",
+      ],
+    },
+    {
       title: "$ref 与循环引用",
       items: [
         "所有 schema/参数/请求体/响应中的 <code>$ref</code> 先解引用再比较",

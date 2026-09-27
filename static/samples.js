@@ -422,6 +422,120 @@ components:
 }`
   },
 
+  auth: {
+    old: `openapi: 3.0.3
+info: { title: "Authz API", version: "1.0.0" }
+security:
+  - oauth2: ["read"]
+paths:
+  /ping:
+    get:
+      operationId: ping
+      security: []
+      responses:
+        '200': { description: 健康检查 }
+  /public:
+    get:
+      operationId: listPublic
+      responses:
+        '200': { description: 公开列表 }
+  /pets:
+    get:
+      operationId: listPets
+      security:
+        - oauth2: ["pets:read"]
+      responses:
+        '200': { description: 宠物列表 }
+    post:
+      operationId: createPet
+      security:
+        - oauth2: ["pets:write"]
+      responses:
+        '201': { description: 已创建 }
+  /pets/{id}:
+    delete:
+      operationId: deletePet
+      security:
+        - apiKey: []
+      responses:
+        '204': { description: 已删除 }
+components:
+  securitySchemes:
+    oauth2:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: https://auth.example.com/authorize
+          tokenUrl: https://auth.example.com/token
+          scopes:
+            read: 只读
+            pets:read: 读取宠物
+            pets:write: 写宠物
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+`,
+    new: `openapi: 3.0.3
+info: { title: "Authz API", version: "2.0.0" }
+security:
+  - oauth2: ["read"]
+paths:
+  /ping:
+    get:
+      operationId: ping
+      security: [{}]
+      responses:
+        '200': { description: 健康检查 }
+  /public:
+    get:
+      operationId: listPublic
+      security:
+        - oauth2: ["pets:read"]
+      responses:
+        '200': { description: 公开列表 }
+  /pets:
+    get:
+      operationId: listPets
+      security:
+        - oauth2: ["pets:read", "pets:admin"]
+      responses:
+        '200': { description: 宠物列表 }
+    post:
+      operationId: createPet
+      security:
+        - apiKey: []
+      responses:
+        '201': { description: 已创建 }
+  /pets/{id}:
+    delete:
+      operationId: deletePet
+      security:
+        - apiKey: []
+        - oauth2: ["admin"]
+      responses:
+        '204': { description: 已删除 }
+components:
+  securitySchemes:
+    oauth2:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: https://auth.example.com/authorize
+          tokenUrl: https://auth.example.com/token
+          scopes:
+            read: 只读
+            pets:read: 读取宠物
+            pets:write: 写宠物
+            pets:admin: 管理宠物
+            admin: 管理员
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+`
+  },
+
   enum: {
     old: `openapi: 3.0.3
 info: { title: "Tickets", version: "3.0.0" }
