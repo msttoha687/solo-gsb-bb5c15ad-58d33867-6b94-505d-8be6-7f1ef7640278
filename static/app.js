@@ -1329,6 +1329,18 @@
       ],
     },
     {
+      title: "认证要求（security）",
+      items: [
+        "仅比较两版都存在的 paths 操作；操作级 <code>security</code> 覆盖根级 <code>security</code> 后再比较",
+        "<code>缺省 / [] / [{}]</code> 三种写法等价：均表示该操作允许匿名访问",
+        "security 数组中的对象之间是<b>或</b>（任一满足即可），同一对象内的多个方案是<b>且</b>（须同时满足）",
+        "OAuth2 / OpenID Connect 方案的 scope 集合须全部满足：scope 变多（如 <code>read</code> → <code>read write</code>）为 🔴 收紧，变少为 🟢 放宽",
+        "旧版任一可用认证组合在新版找不到「要求不更严」的组合 → 🔴 <code>security-requirement-tightened</code>（401/403 风险）",
+        "典型收紧：匿名 → 要求认证、<code>[A 或 B]</code> 仅保留 A、A 变为 <code>A 且 B</code>、新增必需 scope",
+        "要求放宽或新增可用组合（旧版组合在新版仍可用）→ 🟢 <code>security-requirement-relaxed</code>",
+      ],
+    },
+    {
       title: "$ref 与循环引用",
       items: [
         "所有 schema/参数/请求体/响应中的 <code>$ref</code> 先解引用再比较",

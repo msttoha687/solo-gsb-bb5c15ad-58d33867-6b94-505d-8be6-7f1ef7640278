@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -430,8 +431,117 @@ class Engine:
             old_path_item, new_path_item,
             old_op, new_op, path
         )
+        self._compare_security(endpoint, base, old_op, new_op)
         self._compare_request_body(endpoint, base, old_op, new_op)
         self._compare_responses(endpoint, base, old_op, new_op)
+
+    # ------------------------------------------------------------------ #
+    # 认证要求（security：操作级覆盖根级；对象间"或"，对象内"且"）
+    # ------------------------------------------------------------------ #
+    def _compare_security(
+        self, endpoint: str, base: str, old_op: dict, new_op: dict
+    ) -> None:
+        """比较操作的有效认证要求（操作级 security 覆盖根级 security）。
+
+        仅在两版都存在该操作时调用。缺省 / 空数组 / [{}] 都归一化为
+        "允许匿名"；security 列表中的对象之间为"或"，同一对象内的方案
+        为"且"，OAuth2/OpenID 方案须满足其 scope 集合。旧版任一可用组合
+        在新版找不到"要求不更严"的组合即破坏性收紧。
+        """
+        old_source = old_op.get("security")
+        new_source = new_op.get("security")
+        old_overrides = isinstance(old_source, list)
+        new_overrides = isinstance(new_source, list)
+
+        old_effective, old_norm = self._effective_security(
+            old_source if old_overrides else self.old.get("security")
+        )
+        new_effective, new_norm = self._effective_security(
+            new_source if new_overrides else self.new.get("security")
+        )
+        if old_norm == new_norm:
+            return  # 有效要求完全一致（含双侧都允许匿名）
+
+        common = dict(
+            category="认证", direction="none", endpoint=endpoint,
+            location="security",
+            old_json_path=(base + "/security") if old_overrides else "/security",
+            new_json_path=(base + "/security") if new_overrides else "/security",
+            old_ref=None, new_ref=None,
+        )
+
+        # 旧版每个"或"组合都必须能在新版找到一个要求不更严的组合
+        unsupported = [
+            combo for combo in old_effective
+            if not any(_combo_covers(combo, cand) for cand in new_effective)
+        ]
+        if unsupported:
+            details = "；".join(_combo_label(c) for c in unsupported)
+            self.add(
+                rule_id="security-requirement-tightened", severity=BREAKING,
+                change="changed",
+                message=(
+                    f"操作 {endpoint} 的认证要求收紧：旧版可用认证组合"
+                    f"（{details}）在新版找不到要求不更严的组合，"
+                    "仅凭现有凭据/授权范围的调用方可能被拒绝（401/403）。"
+                ),
+                old_value={"effective": old_norm},
+                new_value={"effective": new_norm},
+                **common,
+            )
+        else:
+            if any(not combo for combo in new_effective):
+                msg = (
+                    f"操作 {endpoint} 的认证要求放宽：新版允许匿名访问"
+                    "（旧版要求认证）。"
+                )
+            else:
+                msg = (
+                    f"操作 {endpoint} 的认证要求放宽或新增可用认证组合，"
+                    "旧版的全部可用认证组合在新版仍可使用。"
+                )
+            self.add(
+                rule_id="security-requirement-relaxed", severity=NON_BREAKING,
+                change="changed",
+                message=msg,
+                old_value={"effective": old_norm},
+                new_value={"effective": new_norm},
+                **common,
+            )
+
+    def _effective_security(
+        self, security: Any
+    ) -> tuple[list[frozenset[tuple[str, frozenset[str]]]], Any]:
+        """计算有效安全要求，返回 (组合集合, 规范值)。
+
+        - 缺省（非列表）→ 回落根级由调用方处理；若最终仍非列表，按 OAS
+          默认安全（无要求）处理为允许匿名；
+        - 空数组 [] / [{}]（或全部为空对象）→ 允许匿名；
+        - 每个非空 requirement 对象是一个"或"组合：frozenset 的
+          (方案名, 必须满足的 scope 集合)。
+        """
+        combos: list[frozenset[tuple[str, frozenset[str]]]] = []
+        if isinstance(security, list):
+            for req in security:
+                if not isinstance(req, dict):
+                    continue
+                combo = frozenset(
+                    (str(name), frozenset(str(s) for s in (scopes or [])))
+                    for name, scopes in req.items()
+                    if isinstance(scopes, list)
+                )
+                if combo:
+                    combos.append(combo)
+        # 缺省 / 空数组 / [{}]：空组合 = 匿名即可
+        if not combos:
+            combos = [frozenset()]
+
+        # 去重（重复的"或"分支无额外语义），保持展示顺序确定
+        uniq: list[frozenset[tuple[str, frozenset[str]]]] = []
+        for c in combos:
+            if c not in uniq:
+                uniq.append(c)
+        return uniq, _security_json(uniq)
 
     # ------------------------------------------------------------------ #
     # 参数
@@ -1612,6 +1722,49 @@ def _media_types(rb: Any) -> list[str]:
     if isinstance(rb, dict) and isinstance(rb.get("content"), dict):
         return list(rb["content"])
     return []
+
+
+def _combo_covers(
+    old_combo: frozenset[tuple[str, frozenset[str]]],
+    new_combo: frozenset[tuple[str, frozenset[str]]],
+) -> bool:
+    """新版组合 new_combo 的要求是否不更严于旧版组合 old_combo。
+
+    即：满足旧版组合的客户端是否天然满足新版组合——新版要求的每个方案
+    都必须已包含在旧版组合中，且其必须满足的 scope 集合是旧版的子集；
+    新版匿名（空组合）恒为不更严。
+    """
+    old_by_name = dict(old_combo)
+    for name, new_scopes in new_combo:
+        old_scopes = old_by_name.get(name)
+        if old_scopes is None or not new_scopes.issubset(old_scopes):
+            return False
+    return True
+
+
+def _combo_json(combo: frozenset[tuple[str, frozenset[str]]]) -> Any:
+    """单个认证组合的规范展示值；空组合表示允许匿名。"""
+    if not combo:
+        return {"anonymous": True}
+    return {name: sorted(scopes) for name, scopes in sorted(combo)}
+
+
+def _security_json(
+    combos: list[frozenset[tuple[str, frozenset[str]]]],
+) -> list[Any]:
+    """有效安全要求的规范值：对象间"或"的组合列表。"""
+    return [_combo_json(c) for c in sorted(combos, key=lambda c: json.dumps(
+        _combo_json(c), ensure_ascii=False, sort_keys=True
+    ))]
+
+
+def _combo_label(combo: frozenset[tuple[str, frozenset[str]]]) -> str:
+    if not combo:
+        return "匿名可访问"
+    parts = []
+    for name, scopes in sorted(combo):
+        parts.append(f"{name}[{', '.join(sorted(scopes))}]" if scopes else name)
+    return " 且 ".join(parts)
 
 
 def _param_brief(p: dict) -> dict:

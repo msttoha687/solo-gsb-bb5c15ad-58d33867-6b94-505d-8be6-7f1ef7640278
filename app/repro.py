@@ -92,6 +92,15 @@ def _needs_servers(finding: dict[str, Any]) -> bool:
     )
 
 
+def _needs_root_security(finding: dict[str, Any]) -> bool:
+    """认证要求类发现需要保留根级 security 才能复现（操作级覆盖的对照基线）。"""
+    rule = str(finding.get("rule_id") or "")
+    return rule.startswith("security-requirement") or any(
+        str(finding.get(k) or "") == "/security"
+        for k in ("old_json_path", "new_json_path")
+    )
+
+
 def _trim_path_item(item: Any, method: str | None) -> Any:
     """裁剪单个 path item。
 
@@ -117,6 +126,7 @@ def _minimal_doc(
     path: str | None,
     method: str | None,
     keep_servers: bool,
+    keep_root_security: bool = False,
 ) -> dict[str, Any]:
     """从完整文档裁剪出最小骨架：文档头 + 目标 path（可能为空 paths）。"""
     out: dict[str, Any] = {}
@@ -125,6 +135,8 @@ def _minimal_doc(
             out[key] = copy.deepcopy(doc[key])
     if keep_servers and isinstance(doc.get("servers"), list):
         out["servers"] = copy.deepcopy(doc["servers"])
+    if keep_root_security and isinstance(doc.get("security"), list):
+        out["security"] = copy.deepcopy(doc["security"])
     paths = doc.get("paths") if isinstance(doc.get("paths"), dict) else {}
     kept: dict[str, Any] = {}
     if path is not None and path in paths:
@@ -254,9 +266,10 @@ def build_repro_package(
 
     method, path = _parse_endpoint(finding.get("endpoint"))
     keep_servers = _needs_servers(finding)
+    keep_root_security = _needs_root_security(finding)
 
-    old_min = _minimal_doc(old_doc, path, method, keep_servers)
-    new_min = _minimal_doc(new_doc, path, method, keep_servers)
+    old_min = _minimal_doc(old_doc, path, method, keep_servers, keep_root_security)
+    new_min = _minimal_doc(new_doc, path, method, keep_servers, keep_root_security)
     _apply_ref_closure(old_doc, old_min)
     _apply_ref_closure(new_doc, new_min)
 

@@ -497,5 +497,82 @@ components:
         priority: { type: string, enum: [low, normal, high, urgent, critical] }
         state: { type: string, enum: [open, closed, archived] }
 `
+  },
+
+  security: {
+    old: `{
+  "openapi": "3.0.3",
+  "info": { "title": "Accounts", "version": "1.0.0" },
+  "security": [{ "oauth": ["read"] }],
+  "paths": {
+    "/accounts": {
+      "get": {
+        "operationId": "listAccounts",
+        "responses": { "200": { "description": "账户列表" } }
+      },
+      "post": {
+        "operationId": "createAccount",
+        "security": [{}],
+        "responses": { "201": { "description": "已创建" } }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "security": [{ "apiKey": [] }, { "oauth": ["read"] }],
+        "responses": { "200": { "description": "健康" } }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "oauth": {
+        "type": "oauth2",
+        "flows": { "implicit": {
+          "authorizationUrl": "https://auth.example/authorize",
+          "scopes": { "read": "读取", "write": "写入" }
+        } }
+      },
+      "apiKey": { "type": "apiKey", "in": "header", "name": "X-API-Key" }
+    }
+  }
+}`,
+    new: `{
+  "openapi": "3.0.3",
+  "info": { "title": "Accounts", "version": "2.0.0" },
+  "security": [{ "oauth": ["read", "write"] }],
+  "paths": {
+    "/accounts": {
+      "get": {
+        "operationId": "listAccounts",
+        "responses": { "200": { "description": "账户列表" } }
+      },
+      "post": {
+        "operationId": "createAccount",
+        "security": [{ "oauth": ["write"] }],
+        "responses": { "201": { "description": "已创建" } }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "security": [{ "apiKey": [] }],
+        "responses": { "200": { "description": "健康" } }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "oauth": {
+        "type": "oauth2",
+        "flows": { "implicit": {
+          "authorizationUrl": "https://auth.example/authorize",
+          "scopes": { "read": "读取", "write": "写入" }
+        } }
+      },
+      "apiKey": { "type": "apiKey", "in": "header", "name": "X-API-Key" }
+    }
+  }
+}`
   }
 };
